@@ -1,51 +1,74 @@
-use std::io::{Error, ErrorKind};
-use tokio::net::UdpSocket;
-use bytes::{BufMut, BytesMut};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use futures_util::{StreamExt, SinkExt};
+use std::sync::Arc;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug)]
-struct Message {
-  sender_id: u32,
-  content: String,
+struct Client {
+    sender: UnboundedSender<Message>,
+}
+
+impl PartialEq for Client {
+    fn eq(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+}
+
+impl Eq for Client {}
+
+impl Hash for Client {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.sender.same_channel(&self.sender).hash(state);
+    }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-  // Server address
-  let server_addr = "127.0.0.1:8080";
+async fn main() {
+    let listener = TcpListener::bind("127.0.0.1:8080").await.expect("Failed to bind to address");
+    let clients = Arc::new(Mutex::new(HashSet::new()));
 
-  // Create socket
-  let socket = UdpSocket::bind(server_addr).await?;
-  println!("Server listening on {}", server_addr);
+    while let Ok((stream, _)) = listener.accept().await {
+        let clients = Arc::clone(&clients);
 
-  let mut buf = BytesMut::with_capacity(1024);
-  loop {
-    // Receive message
-    let (len, addr) = socket.recv_from(&mut buf).await?;
-    buf.truncate(len); // Clear buffer for next message
+        tokio::spawn(handle_connection(stream, clients));
+    }
+}
 
-    // Decode message
-    let message = match serde_json::from_slice(&buf) {
-      Ok(msg) => msg,
-      Err(err) => {
-        eprintln!("Error decoding message: {}", err);
-        continue;
-      }
-    };
+async fn handle_connection(
+    stream: TcpStream,
+    clients: Arc<Mutex<HashSet<Client>>>
+) {
+    let ws_stream = accept_async(stream).await.expect("Failed to accept WebSocket connection");
+    let (mut write, mut read) = ws_stream.split();
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // Validate message format
-    if message.sender_id == 0 || message.content.is_empty() {
-      eprintln!("Invalid message format!");
-      continue;
+    {
+        let mut clients = clients.lock().await;
+        clients.insert(Client { sender: client_tx });
     }
 
-    println!("Received from {}: {:?}", addr, message);
+    let write_task = tokio::spawn(async move {
+        while let Some(msg) = client_rx.recv().await {
+            if write.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
 
-    // Send acknowledgement (optional, for improved reliability)
-    let ack_message = Message { sender_id: 0, content: String::from("ACK") };
-    let encoded_ack = serde_json::to_vec(&ack_message)?;
-    socket.send_to(&encoded_ack, addr).await?;
+    let read_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = read.next().await {
 
-    // Clear buffer for next iteration
-    buf.clear();
-  }
+            let clients = clients.lock().await;
+            for client in clients.iter() {
+                let _ = client.sender.send(msg.clone());
+            }
+        }
+    });
+
+    let _ = tokio::try_join!(write_task, read_task);
 }
