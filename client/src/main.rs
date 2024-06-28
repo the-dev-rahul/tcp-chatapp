@@ -1,43 +1,41 @@
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use futures_util::{StreamExt, SinkExt};
-use url::Url;
-use uuid::Uuid;
+
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 
 #[tokio::main]
-async fn main() {
-    let url = Url::parse("ws://127.0.0.1:8080").unwrap();
-    let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
-    let (mut write, mut read) = ws_stream.split();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    
+    let socket = TcpStream::connect("127.0.0.1:8080").await.unwrap();
+    let (reader, mut writer) = socket.into_split();
+    let mut reader = BufReader::new(reader);
 
-    let client_id = Uuid::new_v4().to_string();
-
-    let client_id_clone = client_id.clone();
     let write_task = tokio::spawn(async move {
-        use tokio::io::{self, AsyncBufReadExt};
-
-        let stdin = io::BufReader::new(io::stdin());
-        let mut lines = stdin.lines();
-
-        while let Ok(Some(line)) = lines.next_line().await {
-            let msg = format!("{}: {}", client_id_clone, line);
-            if write.send(Message::Text(msg)).await.is_err() {
+        let mut stdin = BufReader::new(io::stdin());
+        let mut line = String::new();
+        while let Ok(_message) = stdin.read_line(&mut line).await{
+            if writer.write_all(line.as_bytes()).await.is_err(){
                 break;
             }
+            line.clear();
         }
+
     });
 
-    let client_id_clone = client_id.clone();
-    let read_task = tokio::spawn(async move {
-      while let Some(Ok(message)) = read.next().await {
-            if let Message::Text(txt) = message {
-                let parts: Vec<&str> = txt.splitn(2, ": ").collect();
-                if parts.len() == 2 && parts[0] != client_id_clone {
-                    println!("Received: {}", parts[1]);
-                }
+    let mut line = String::new();
+    let read_task = tokio::spawn(async move{
+
+        while let Ok(_message) = reader.read_line(&mut line).await{
+            if ! line.is_empty() {
+                print!("Received: {}", line);}
+            else {
+                break;
             }
+            line.clear();
+
         }
     });
 
+    
     let _ = tokio::try_join!(write_task, read_task);
+    Ok(())
 }
